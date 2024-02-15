@@ -6,13 +6,13 @@
 
 torch::Tensor randperm(uint32_t N, uint32_t seed);
 
-std::tuple<torch::Tensor, torch::Tensor> parallel_kac_random_walk(
+torch::Tensor parallel_kac_random_walk(
     torch::Tensor x,
     uint32_t seed,
     uint32_t n_steps
 );
 
-std::tuple<torch::Tensor, torch::Tensor> parallel_kac_random_walk_bwd(
+torch::Tensor parallel_kac_random_walk_bwd(
     torch::Tensor x,
     uint32_t seed,
     uint32_t n_steps

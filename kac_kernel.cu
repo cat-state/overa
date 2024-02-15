@@ -200,7 +200,7 @@ bool is_even_power_of_two(int n) {
     return (n & (n - 1)) == 0 && n % 4 == 0;
 }
 
-std::tuple<torch::Tensor, torch::Tensor>  parallel_kac_random_walk(
+torch::Tensor parallel_kac_random_walk(
     torch::Tensor x,
     uint32_t seed,
     uint32_t n_steps
@@ -208,12 +208,18 @@ std::tuple<torch::Tensor, torch::Tensor>  parallel_kac_random_walk(
     TORCH_CHECK(x.dim() == 2, "x must be 2D");
     TORCH_CHECK(is_even_power_of_two(x.size(1)), "x.size(1) must be an even power of 2");
 
-    auto opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
-
     const dim3 blocks(x.size(0));
     const int threads = min(1024, int(x.size(1)) / 2);
     int shared_size;
-    switch (x.type().scalarType()) {
+    switch (x.scalar_type()) {
+        case torch::ScalarType::Double:
+            shared_size = x.size(1) * sizeof(double);
+            parallel_kac_random_walk_kernel<double><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break; 
         case torch::ScalarType::Float:
             shared_size = x.size(1) * sizeof(float);
             parallel_kac_random_walk_kernel<float><<<blocks, threads, shared_size>>>(
@@ -242,21 +248,30 @@ std::tuple<torch::Tensor, torch::Tensor>  parallel_kac_random_walk(
             TORCH_CHECK(false, "Unsupported dtype");
             break;
     }
-    return std::make_tuple(x, x);
+    return x;
 }
 
 
-std::tuple<torch::Tensor, torch::Tensor> parallel_kac_random_walk_bwd(
+torch::Tensor parallel_kac_random_walk_bwd(
     torch::Tensor x,
     uint32_t seed,
     uint32_t n_steps
 ) {
-    auto opts = torch::TensorOptions().dtype(x.dtype()).device(x.device());
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(is_even_power_of_two(x.size(1)), "x.size(1) must be an even power of 2");
 
     const dim3 blocks(x.size(0));
     const int threads = min(1024, int(x.size(1)) / 2);
     int shared_size;
-    switch (x.type().scalarType()) {
+    switch (x.scalar_type()) {
+        case torch::ScalarType::Double:
+            shared_size = x.size(1) * sizeof(double);
+            parallel_kac_random_walk_bwd_kernel<double><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
         case torch::ScalarType::Float:
             shared_size = x.size(1) * sizeof(float);
             parallel_kac_random_walk_bwd_kernel<float><<<blocks, threads, shared_size>>>(
@@ -285,7 +300,7 @@ std::tuple<torch::Tensor, torch::Tensor> parallel_kac_random_walk_bwd(
             TORCH_CHECK(false, "Unsupported dtype");
             break;
     }
-    return std::make_tuple(x, x);
+    return x;
 }
 
 
@@ -321,7 +336,6 @@ __global__ void randperm_kernel(
 torch::Tensor randperm(uint32_t N, uint32_t seed) {
     auto opts = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA, 0);
     torch::Tensor out = torch::ones({N}, opts);
-
 
     const dim3 blocks(2048);
     randperm_kernel<<<blocks, 2>>>(out.mutable_data_ptr<int32_t>(), seed, N);
