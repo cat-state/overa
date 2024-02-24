@@ -195,7 +195,6 @@ __global__ void parallel_kac_random_walk_bwd_kernel(
     barrier.arrive_and_wait();
 }
 
-
 bool is_even_power_of_two(int n) {
     return (n & (n - 1)) == 0 && n % 4 == 0;
 }
@@ -301,6 +300,285 @@ torch::Tensor parallel_kac_random_walk_bwd(
             break;
     }
     return x;
+}
+
+
+template <typename scalar_t>
+__global__ void parallel_parametric_kac_random_walk_kernel(
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> x,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> angles,
+    uint32_t seed,
+    uint32_t n_steps
+) {
+    auto block = cg::this_thread_block();
+    const int32_t b = block.group_index().x;
+    const int32_t tid = block.thread_rank();
+    const int dim = x.size(1);
+
+    const int32_t par_steps = (n_steps + block.size() - 1) / block.size();
+
+    int bit_width = 32 - __clz(dim) - 1;
+    uint32_t left_side_bits = bit_width / 2;
+    uint32_t right_side_bits = bit_width - left_side_bits;
+
+    SharedMemory<scalar_t> shared;
+    scalar_t* shared_x = shared.getPointer();
+
+    __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+    if (block.thread_rank() == 0) {
+        init(&barrier, block.size());
+    }
+    block.sync();
+
+    cuda::memcpy_async(block, shared_x, x[b].data(), dim * sizeof(scalar_t), barrier);
+    barrier.arrive_and_wait();
+
+    for(int32_t par_step = 0; par_step < par_steps; par_step++) {
+        uint32_t keys[4] = {0};
+        for (uint32_t j = 0; j < 1; j++) {
+            uint4 result = curand_Philox4x32_10({0, 0, 0, seed}, {par_step, j});
+            keys[j * 4] = result.x;
+            keys[j * 4 + 1] = result.y;
+            keys[j * 4 + 2] = result.z;
+            keys[j * 4 + 3] = result.w;
+        }
+
+        int32_t step = tid + par_step * block.size();
+        if (step < n_steps) {
+            scalar_t a = angles[b][step];
+            uint32_t r1 = variable_philox(tid * 2, keys, left_side_bits, right_side_bits, 4);
+            uint32_t r2 = variable_philox(tid * 2 + 1, keys, left_side_bits, right_side_bits, 4);
+            scalar_t x1 = shared_x[r1];
+            scalar_t x2 = shared_x[r2];
+            scalar_t y1 = cos(a) * x1 - sin(a) * x2;
+            scalar_t y2 = sin(a) * x1 + cos(a) * x2;
+            shared_x[r1] = y1;
+            shared_x[r2] = y2;
+        }
+        block.sync();
+    }
+
+    cuda::memcpy_async(block, x[b].data(), shared_x, dim * sizeof(scalar_t), barrier);
+    barrier.arrive_and_wait();
+}
+
+
+torch::Tensor parallel_parametric_kac_random_walk(
+    torch::Tensor x,
+    torch::Tensor angles,
+    uint32_t seed,
+    uint32_t n_steps
+)
+{
+    TORCH_CHECK(x.dim() == 2, "x must be 2D");
+    TORCH_CHECK(angles.dim() == 2, "angles must be 2D");
+    TORCH_CHECK(x.size(0) == angles.size(0), "x.size(0) must be equal to angles.size(0)");
+    TORCH_CHECK(is_even_power_of_two(x.size(1)), "x.size(1) must be an even power of 2");
+
+    const dim3 blocks(x.size(0));
+    const int threads = min(1024, int(x.size(1)) / 2);
+    int shared_size;
+    switch (x.scalar_type()) {
+        case torch::ScalarType::Double:
+            shared_size = 2 * x.size(1) * sizeof(double);
+            parallel_parametric_kac_random_walk_kernel<double><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::Float:
+            shared_size = 2 * x.size(1) * sizeof(float);
+            parallel_parametric_kac_random_walk_kernel<float><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::Half:
+            shared_size = 2 * x.size(1) * sizeof(at::Half);
+            parallel_parametric_kac_random_walk_kernel<at::Half><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::BFloat16:
+            shared_size = 2 * x.size(1) * sizeof(at::BFloat16);
+            parallel_parametric_kac_random_walk_kernel<at::BFloat16><<<blocks, threads, shared_size>>>(
+                x.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        default:
+            TORCH_CHECK(false, "Unsupported dtype");
+            break;
+    }
+    return x;
+}
+
+
+
+template <typename scalar_t>
+__global__ void parallel_parametric_kac_random_walk_bwd_kernel(
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> y,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> grad_output,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> grad_input,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> angles,
+    torch::PackedTensorAccessor32<scalar_t, 2, torch::RestrictPtrTraits> angles_grad,
+    uint32_t seed,
+    uint32_t n_steps
+)   
+{
+    auto block = cg::this_thread_block();
+    const int32_t b = block.group_index().x;
+    const int32_t tid = block.thread_rank();
+    const int dim = y.size(1);
+
+    const int32_t par_steps = (n_steps + block.size() - 1) / block.size();
+
+    int bit_width = 32 - __clz(dim) - 1;
+    uint32_t left_side_bits = bit_width / 2;
+    uint32_t right_side_bits = bit_width - left_side_bits;
+
+    SharedMemory<scalar_t> shared;
+    scalar_t* shared_x = shared.getPointer();
+    scalar_t* shared_grad_output = shared.getPointer() + dim;
+
+    __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
+    if (block.thread_rank() == 0) {
+        init(&barrier, block.size());
+    }
+    block.sync();
+
+    cuda::memcpy_async(block, shared_x, y[b].data(), dim * sizeof(scalar_t), barrier);
+    cuda::memcpy_async(block, shared_grad_output, grad_output[b].data(), dim * sizeof(scalar_t), barrier);
+    barrier.arrive_and_wait();
+
+    for(int32_t par_step = par_steps - 1; par_step >= 0; par_step--) {
+        uint32_t keys[4] = {0};
+        for (uint32_t j = 0; j < 1; j++) {
+            uint4 result = curand_Philox4x32_10({0, 0, 0, seed}, {par_step, j});
+            keys[j * 4] = result.x;
+            keys[j * 4 + 1] = result.y;
+            keys[j * 4 + 2] = result.z;
+            keys[j * 4 + 3] = result.w;
+        }
+
+        int32_t step = tid + par_step * block.size();
+        if (step < n_steps) {
+            scalar_t a = -angles[b][step];
+            uint32_t r1 = variable_philox(tid * 2, keys, left_side_bits, right_side_bits, 4);
+            uint32_t r2 = variable_philox(tid * 2 + 1, keys, left_side_bits, right_side_bits, 4);
+            scalar_t x1 = shared_x[r1];
+            scalar_t x2 = shared_x[r2];
+            scalar_t g1 = shared_grad_output[r1];
+            scalar_t g2 = shared_grad_output[r2];
+
+            scalar_t y1 = cos(a) * x1 - sin(a) * x2;
+            scalar_t y2 = sin(a) * x1 + cos(a) * x2;
+
+            scalar_t g_y1 = cos(a) * g1 - sin(a) * g2;
+            scalar_t g_y2 = sin(a) * g1 + cos(a) * g2;
+
+            scalar_t grad_angle = g_y2 * y1 - g_y1 * y2;
+            angles_grad[b][step] = grad_angle;
+
+            shared_x[r1] = y1;
+            shared_x[r2] = y2;
+
+            shared_grad_output[r1] = g_y1;
+            shared_grad_output[r2] = g_y2;
+        }
+        block.sync();
+    }
+
+    cuda::memcpy_async(block, grad_input[b].data(), shared_grad_output, dim * sizeof(scalar_t), barrier);
+    barrier.arrive_and_wait();
+}
+
+
+std::tuple<torch::Tensor, torch::Tensor> parallel_parametric_kac_random_walk_bwd(
+    torch::Tensor y,
+    torch::Tensor grad_output,
+    torch::Tensor angles,
+    uint32_t seed,
+    uint32_t n_steps
+)
+{
+    TORCH_CHECK(y.dim() == 2, "y must be 2D");
+    TORCH_CHECK(grad_output.dim() == 2, "grad_output must be 2D");
+    TORCH_CHECK(angles.dim() == 2, "angles must be 2D");
+    TORCH_CHECK(y.size(0) == grad_output.size(0), "y.size(0) must be equal to grad_output.size(0)");
+    TORCH_CHECK(y.size(1) == grad_output.size(1), "y.size(1) must be equal to grad_output.size(1)");
+    TORCH_CHECK(y.size(0) == angles.size(0), "y.size(0) must be equal to angles.size(0)");
+    TORCH_CHECK(is_even_power_of_two(y.size(1)), "y.size(1) must be an even power of 2");
+
+    auto grad_input = torch::zeros_like(grad_output);
+    auto angles_grad = torch::zeros_like(angles);
+
+    const dim3 blocks(y.size(0));
+    const int threads = min(1024, int(y.size(1)) / 2);
+    int shared_size;
+    switch (y.scalar_type()) {
+        case torch::ScalarType::Double:
+            shared_size = 2 * y.size(1) * sizeof(double);
+            parallel_parametric_kac_random_walk_bwd_kernel<double><<<blocks, threads, shared_size>>>(
+                y.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                grad_output.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                grad_input.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                angles_grad.packed_accessor32<double, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::Float:
+            shared_size = 2 * y.size(1) * sizeof(float);
+            parallel_parametric_kac_random_walk_bwd_kernel<float><<<blocks, threads, shared_size>>>(
+                y.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                grad_output.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                grad_input.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                angles_grad.packed_accessor32<float, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::Half:
+            shared_size = 2 * y.size(1) * sizeof(at::Half);
+            parallel_parametric_kac_random_walk_bwd_kernel<at::Half><<<blocks, threads, shared_size>>>(
+                y.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                grad_output.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                grad_input.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                angles_grad.packed_accessor32<at::Half, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        case torch::ScalarType::BFloat16:
+            shared_size = 2 * y.size(1) * sizeof(at::BFloat16);
+            parallel_parametric_kac_random_walk_bwd_kernel<at::BFloat16><<<blocks, threads, shared_size>>>(
+                y.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                grad_output.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                grad_input.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                angles.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                angles_grad.packed_accessor32<at::BFloat16, 2, torch::RestrictPtrTraits>(),
+                seed,
+                n_steps
+            );
+            break;
+        default:
+            TORCH_CHECK(false, "Unsupported dtype");
+            break;
+    }
+    return std::make_tuple(grad_input, angles_grad);
 }
 
 
